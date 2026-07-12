@@ -2,7 +2,6 @@ import dash
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 from dash.dependencies import Input, Output, State
-from flask import Response
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -365,6 +364,16 @@ body::after {
 .nv-corner.tr { top: 10px; right: 10px; border-top-width: 1px; border-right-width: 1px; }
 .nv-corner.bl { bottom: 10px; left: 10px; border-bottom-width: 1px; border-left-width: 1px; }
 .nv-corner.br { bottom: 10px; right: 10px; border-bottom-width: 1px; border-right-width: 1px; }
+
+/* ---------- Webcam (browser-side) ---------- */
+#webcam-video {
+    width: 100%;
+    max-width: 640px;
+    border-radius: 10px;
+    display: block;
+    margin: 0 auto;
+}
+#webcam-canvas { display: none; }
 """
 
 app.index_string = f"""
@@ -456,12 +465,18 @@ app.layout = html.Div(
                 ]),
             ]),
         ], className="g-4"),
+
+        # Hidden store that receives base64 frames captured by the browser JS
+        dcc.Store(id='webcam-frame-store'),
+        # Interval that triggers periodic frame capture on the client
+        dcc.Interval(id='webcam-interval', interval=1200, disabled=True),
     ],
 )
 
 # --- 5. CALLBACKS ---
 @app.callback(Output('output-display', 'children'),
               Output('tab-content', 'children'),
+              Output('webcam-interval', 'disabled'),
               Input('input-method-tabs', 'active_tab'))
 def switch_tab(at):
     if at == "tab-upload":
@@ -470,30 +485,99 @@ def switch_tab(at):
             className="nv-upload",
             children=html.Div(['Drag and drop or ', html.A('select an image file')]),
         )
-        return placeholder_block("upload an image to begin"), upload_content
+        return placeholder_block("upload an image to begin"), upload_content, True
+
     if at == "tab-camera":
-        camera_content = dbc.Button('Start / Stop Camera', id='start-camera-button',
-                                    className="nv-btn", n_clicks=0)
-        return placeholder_block("camera idle"), camera_content
-    return "Something went wrong", html.Div()
+        camera_content = html.Div([
+            dbc.Button('Start / Stop Camera', id='start-camera-button', className="nv-btn", n_clicks=0),
+        ])
+        return placeholder_block("camera idle"), camera_content, True
+
+    return "Something went wrong", html.Div(), True
+
 
 @app.callback(
     Output('output-display', 'children', allow_duplicate=True),
-    Input('upload-image', 'contents'),
-    State('upload-image', 'filename'),
+    Output('webcam-interval', 'disabled', allow_duplicate=True),
+    Input('start-camera-button', 'n_clicks'),
     State('model-selector-dropdown', 'value'),
     prevent_initial_call=True
 )
-def update_upload_output(contents, filename, model_name):
-    if contents is None:
-        return placeholder_block("upload an image to begin")
-    if not model_name:
-        return dbc.Alert("Please select a model first.", color="warning")
+def toggle_camera(n_clicks, model_name):
+    if n_clicks % 2 == 1:
+        if not model_name:
+            return dbc.Alert("Please select a model first.", color="warning"), True
 
-    model = models_dict[model_name]
-    content_type, content_string = contents.split(',')
-    decoded = base64.b64decode(content_string)
-    image_pil = Image.open(io.BytesIO(decoded)).convert('RGB')
+        # This raw HTML block runs the browser's own webcam via getUserMedia.
+        # It captures a frame to a hidden canvas and stores the base64 JPEG
+        # in a hidden <div id="webcam-frame-store-raw"> that Dash's clientside
+        # callback reads and syncs into dcc.Store.
+        webcam_html = """
+        <div>
+            <video id="webcam-video" autoplay playsinline muted></video>
+            <canvas id="webcam-canvas"></canvas>
+        </div>
+        <script>
+        (function() {
+            const video = document.getElementById('webcam-video');
+            const canvas = document.getElementById('webcam-canvas');
+            if (!video || !canvas) return;
+
+            if (window._webcamStream) {
+                window._webcamStream.getTracks().forEach(t => t.stop());
+            }
+
+            navigator.mediaDevices.getUserMedia({ video: true })
+                .then(function(stream) {
+                    window._webcamStream = stream;
+                    video.srcObject = stream;
+                })
+                .catch(function(err) {
+                    console.error('Webcam access denied or unavailable:', err);
+                });
+        })();
+        </script>
+        """
+        return html.Iframe(
+            srcDoc=webcam_html,
+            style={"width": "100%", "height": "480px", "border": "none"},
+            id="webcam-frame"
+        ), False
+    else:
+        if 'window' in dir():
+            pass
+        return placeholder_block("camera idle"), True
+
+
+# Clientside callback: every interval tick, grab a frame from the <video>
+# inside the iframe, draw it to canvas, convert to base64 JPEG, and push
+# it into dcc.Store so a normal Dash callback can process it server-side.
+app.clientside_callback(
+    """
+    function(n_intervals) {
+        const iframe = document.getElementById('webcam-frame');
+        if (!iframe) { return window.dash_clientside.no_update; }
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        const video = doc.getElementById('webcam-video');
+        const canvas = doc.getElementById('webcam-canvas');
+        if (!video || !canvas || video.readyState < 2) {
+            return window.dash_clientside.no_update;
+        }
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+        return dataUrl;
+    }
+    """,
+    Output('webcam-frame-store', 'data'),
+    Input('webcam-interval', 'n_intervals'),
+)
+
+
+def run_inference_on_image(image_pil, model):
+    """Shared inference routine for both uploaded images and webcam frames."""
     image_cv = cv2.cvtColor(np.array(image_pil), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
     faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
@@ -514,67 +598,55 @@ def update_upload_output(contents, filename, model_name):
     pil_img_result = Image.fromarray(image_rgb)
     buffer = io.BytesIO()
     pil_img_result.save(buffer, format="PNG")
-    encoded_image_string = base64.b64encode(buffer.getvalue()).decode()
-    return html.Img(src=f'data:image/png;base64,{encoded_image_string}')
+    return base64.b64encode(buffer.getvalue()).decode()
+
 
 @app.callback(
     Output('output-display', 'children', allow_duplicate=True),
-    Input('start-camera-button', 'n_clicks'),
+    Input('upload-image', 'contents'),
+    State('upload-image', 'filename'),
     State('model-selector-dropdown', 'value'),
     prevent_initial_call=True
 )
-def toggle_camera(n_clicks, model_name):
-    if n_clicks % 2 == 1:
-        if not model_name:
-            return dbc.Alert("Please select a model first.", color="warning")
-        return html.Img(src=f"/video_feed/{model_name}")
-    else:
-        return placeholder_block("camera idle")
+def update_upload_output(contents, filename, model_name):
+    if contents is None:
+        return placeholder_block("upload an image to begin")
+    if not model_name:
+        return dbc.Alert("Please select a model first.", color="warning")
 
-# --- 6. VIDEO STREAMING LOGIC ---
-def generate_frames(model_name):
-    camera = cv2.VideoCapture(0)
     model = models_dict[model_name]
-    
-    if not camera.isOpened():
-        return
+    content_type, content_string = contents.split(',')
+    decoded = base64.b64decode(content_string)
+    image_pil = Image.open(io.BytesIO(decoded)).convert('RGB')
+
+    encoded_image_string = run_inference_on_image(image_pil, model)
+    return html.Img(src=f'data:image/png;base64,{encoded_image_string}')
+
+
+@app.callback(
+    Output('output-display', 'children', allow_duplicate=True),
+    Input('webcam-frame-store', 'data'),
+    State('model-selector-dropdown', 'value'),
+    prevent_initial_call=True
+)
+def process_webcam_frame(data_url, model_name):
+    if not data_url:
+        return dash.no_update
+    if not model_name:
+        return dbc.Alert("Please select a model first.", color="warning")
 
     try:
-        while True:
-            success, frame = camera.read()
-            if not success:
-                break # Exit the loop if the camera stops responding
+        header, content_string = data_url.split(',')
+        decoded = base64.b64decode(content_string)
+        image_pil = Image.open(io.BytesIO(decoded)).convert('RGB')
+    except Exception:
+        return dash.no_update
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
-            pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    model = models_dict[model_name]
+    encoded_image_string = run_inference_on_image(image_pil, model)
+    return html.Img(src=f'data:image/png;base64,{encoded_image_string}')
 
-            for (x, y, w, h) in faces:
-                cv2.rectangle(frame, (x, y), (x + w, y + h), (225, 220, 201), 2)
-                face_roi = pil_frame.crop((x, y, x + w, y + h))
-                image_tensor = transform(face_roi).unsqueeze(0)
-                
-                with torch.no_grad():
-                    age_pred, gender_pred, ethnicity_pred = model(image_tensor)
-                    gender = GENDER_MAP[torch.sigmoid(gender_pred).round().long().item()]
-                    ethnicity = ETHNICITY_MAP[torch.max(ethnicity_pred, 1)[1].item()]
-                    age = f"{age_pred.item():.1f}"
-                
-                text = f"{ethnicity}, {gender}, {age} yrs"
-                cv2.putText(frame, text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (225, 220, 201), 2)
 
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
-    finally:
-        # This part runs when the loop breaks or the generator is closed
-        camera.release()
-
-@server.route('/video_feed/<model_name>')
-def video_feed(model_name):
-    return Response(generate_frames(model_name), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# --- 7. RUN APP ---
+# --- 6. RUN APP ---
 if __name__ == '__main__':
     app.run(debug=True)
