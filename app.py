@@ -11,13 +11,10 @@ import cv2
 import numpy as np
 import base64
 import io
-import gc
-import os
 
 # --- 1. SETUP & MODEL DEFINITIONS ---
 ETHNICITY_MAP = {0: 'White', 1: 'Black', 2: 'Asian', 3: 'Indian', 4: 'Other'}
 GENDER_MAP = {0: 'Male', 1: 'Female'}
-MODEL_NAMES = ['resnet50', 'mobilenetv2', 'efficientnet']
 
 class MultiTaskModel(nn.Module):
     def __init__(self, base_model, in_features, num_ethnicities):
@@ -33,49 +30,42 @@ class MultiTaskModel(nn.Module):
 def get_model_architecture(model_name, num_ethnicities):
     if model_name == 'resnet50':
         base = models.resnet50(weights=None)
-        in_features = base.fc.in_features
-        base.fc = nn.Identity()
+        in_features = base.fc.in_features; base.fc = nn.Identity()
     elif model_name == 'mobilenetv2':
         base = models.mobilenet_v2(weights=None)
-        in_features = base.classifier[1].in_features
-        base.classifier = nn.Identity()
+        in_features = base.classifier[1].in_features; base.classifier = nn.Identity()
     elif model_name == 'efficientnet':
         base = models.efficientnet_b0(weights=None)
-        in_features = base.classifier[1].in_features
-        base.classifier = nn.Identity()
-    else: 
-        raise ValueError("Unknown model name")
+        in_features = base.classifier[1].in_features; base.classifier = nn.Identity()
+    else: raise ValueError("Unknown model name")
     return MultiTaskModel(base, in_features, num_ethnicities)
 
-# --- 2. LAZY MODEL LOADING (hemat RAM) ---
-_current_model = {"name": None, "model": None}
-
-def get_model(name):
-    if _current_model["name"] == name and _current_model["model"] is not None:
-        return _current_model["model"]
-
-    print(f"Loading model: {name}...")
+# --- 2. LOAD MODELS ---
+def load_all_models():
+    print("Loading all available models...")
     device = torch.device("cpu")
-    model = get_model_architecture(name, num_ethnicities=5)
-    model.load_state_dict(torch.load(f"{name}_age_gender_ethnicity.pth", map_location=device))
-    model.eval()
+    models_dict = {}
+    model_names = ['resnet50', 'mobilenetv2', 'efficientnet']
+    num_ethnicities = 5
 
-    # Unload previous model if exists
-    if _current_model["model"] is not None:
-        print(f"Unloading previous model: {_current_model['name']}")
-        del _current_model["model"]
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    for name in model_names:
+        try:
+            model_path = f"{name}_age_gender_ethnicity.pth"
+            model = get_model_architecture(name, num_ethnicities)
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.eval()
+            models_dict[name] = model
+            print(f"-> Weights for '{name}' loaded successfully.")
+        except FileNotFoundError:
+            print(f"-> Warning: '{model_path}' not found. This model will not be available.")
+        except Exception as e:
+            print(f"-> Warning: Failed to load '{name}'. Error: {e}")
 
-    _current_model["name"] = name
-    _current_model["model"] = model
-    gc.collect()
-    print(f"Model {name} loaded successfully.")
-    return model
+    face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
+    print("Model initialization complete.")
+    return models_dict, face_cascade
 
-# Load face cascade (lightweight, stays in memory)
-face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
+models_dict, face_cascade = load_all_models()
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -418,7 +408,7 @@ app.layout = html.Div(
             ]),
             html.Div(className="nv-status", children=[
                 html.Div(className="nv-status-dot"),
-                html.Span(f"{len(MODEL_NAMES)} models available"),
+                html.Span(f"{len(models_dict)} models online"),
             ]),
         ]),
 
@@ -436,8 +426,8 @@ app.layout = html.Div(
                     dcc.Dropdown(
                         id='model-selector-dropdown',
                         className="nv-dropdown",
-                        options=[{'label': name.upper(), 'value': name} for name in MODEL_NAMES],
-                        value=MODEL_NAMES[0],
+                        options=[{'label': name.upper(), 'value': name} for name in models_dict.keys()],
+                        value=next(iter(models_dict.keys()), None),
                         clearable=False,
                     ),
 
@@ -500,7 +490,7 @@ def update_upload_output(contents, filename, model_name):
     if not model_name:
         return dbc.Alert("Please select a model first.", color="warning")
 
-    model = get_model(model_name)
+    model = models_dict[model_name]
     content_type, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
     image_pil = Image.open(io.BytesIO(decoded)).convert('RGB')
@@ -544,7 +534,7 @@ def toggle_camera(n_clicks, model_name):
 # --- 6. VIDEO STREAMING LOGIC ---
 def generate_frames(model_name):
     camera = cv2.VideoCapture(0)
-    model = get_model(model_name)
+    model = models_dict[model_name]
     
     if not camera.isOpened():
         return
@@ -553,7 +543,7 @@ def generate_frames(model_name):
         while True:
             success, frame = camera.read()
             if not success:
-                break
+                break # Exit the loop if the camera stops responding
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(100, 100))
@@ -578,6 +568,7 @@ def generate_frames(model_name):
             yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             
     finally:
+        # This part runs when the loop breaks or the generator is closed
         camera.release()
 
 @server.route('/video_feed/<model_name>')
@@ -586,5 +577,4 @@ def video_feed(model_name):
 
 # --- 7. RUN APP ---
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8050))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(debug=True)
